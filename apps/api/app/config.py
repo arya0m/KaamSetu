@@ -41,6 +41,32 @@ class Settings(BaseSettings):
 
     readiness_timeout_s: float = Field(default=2.0, gt=0)
 
+    # --- WhatsApp (Twilio; PRD open question resolved: Twilio sandbox) -----
+    whatsapp_provider: Literal["twilio"] = "twilio"
+    twilio_account_sid: str = ""
+    twilio_auth_token: str = ""  # also the webhook signing key; empty rejects every webhook
+    twilio_whatsapp_from: str = ""  # e.g. whatsapp:+14155238886 for the sandbox
+    twilio_api_base_url: str = "https://api.twilio.com"
+    # The exact public URL Twilio calls; webhook signatures are computed over it.
+    public_base_url: str = "http://localhost:8000"
+    # The Twilio sandbox allows one message per 3 s; 0 disables throttling.
+    whatsapp_min_send_interval_ms: int = Field(default=0, ge=0)
+    whatsapp_send_timeout_s: float = Field(default=10.0, gt=0)
+
+    # --- Onboarding and consent (FR-1) --------------------------------------
+    privacy_notice_url: str = "http://localhost:3000/privacy"
+    # Pre-consent state (step, chosen language) lives only in Redis, then expires.
+    preconsent_ttl_s: int = Field(default=86_400, gt=0)
+    # Webhook de-duplication window for provider message IDs.
+    idempotency_ttl_s: int = Field(default=7 * 86_400, gt=0)
+
+    # --- Phone numbers ------------------------------------------------------
+    # Secret salt for the lookup hash (HMAC-SHA256). No default: it is a secret.
+    phone_hash_salt: str
+    # "none" stores the number as plaintext until Phase 7 adds encryption.
+    # Production refuses to start with "none".
+    phone_encryption: Literal["none"] = "none"
+
     @model_validator(mode="after")
     def _weights_sum_to_one(self) -> "Settings":
         total = self.match_weight_skill + self.match_weight_distance + self.match_weight_experience
@@ -55,11 +81,25 @@ class Settings(BaseSettings):
             return self
         problems = [
             f"{name} still contains the .env.example placeholder"
-            for name in ("database_url", "redis_url", "celery_broker_url")
+            for name in (
+                "database_url",
+                "redis_url",
+                "celery_broker_url",
+                "twilio_auth_token",
+                "phone_hash_salt",
+            )
             if PLACEHOLDER_SECRET in (getattr(self, name) or "")
         ]
-        if not self.dashboard_origin.startswith("https://"):
-            problems.append("dashboard_origin must use https:// in production")
+        for name in ("dashboard_origin", "public_base_url", "privacy_notice_url"):
+            if not getattr(self, name).startswith("https://"):
+                problems.append(f"{name} must use https:// in production")
+        for name in ("twilio_account_sid", "twilio_auth_token", "twilio_whatsapp_from"):
+            if not getattr(self, name):
+                problems.append(f"{name} must be set in production")
+        if len(self.phone_hash_salt) < 32:
+            problems.append("phone_hash_salt must be at least 32 characters in production")
+        if self.phone_encryption == "none":
+            problems.append("phone numbers are stored unencrypted until Phase 7 adds encryption")
         if problems:
             raise ValueError("unsafe production settings: " + "; ".join(problems))
         return self

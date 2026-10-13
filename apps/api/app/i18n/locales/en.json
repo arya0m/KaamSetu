@@ -1,0 +1,27 @@
+{
+  "name": "English",
+  "english_name": "English",
+  "welcome": "Welcome to KaamSetu!",
+  "choose_language": "Choose your language, reply with a number:",
+  "language_invalid": "Please reply with a number from the list.",
+  "privacy_line": "Privacy: {privacy_url}",
+  "consent_request": "To find you jobs, KaamSetu saves your phone number, language and work details. Privacy: {privacy_url}\nReply 1 = I agree\nReply 2 = No",
+  "consent_invalid": "Please reply 1 to agree or 2 for no.",
+  "consent_thanks": "Thank you! You are registered with KaamSetu. Send a message to continue.",
+  "consent_declined": "Okay, nothing was saved. Message us any time to start again.",
+  "echo": "You said: {text}",
+  "unsupported_media": "Voice notes are coming soon. Please type your message for now.",
+  "yes_words": [
+    "yes",
+    "y",
+    "agree",
+    "i agree",
+    "ok",
+    "okay"
+  ],
+  "no_words": [
+    "no",
+    "n",
+    "disagree"
+  ]
+}

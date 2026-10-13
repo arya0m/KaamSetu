@@ -6,13 +6,10 @@ migration to a real PostgreSQL+pgvector (TEST_DATABASE_URL).
 
 import io
 import uuid
-from collections.abc import Iterator
-from pathlib import Path
 
 import pytest
 from alembic import command
 from alembic.autogenerate import compare_metadata
-from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import DateTime, Engine, create_engine, inspect, text
@@ -36,8 +33,7 @@ from app.models import (
     Worker,
     WorkerProfile,
 )
-
-API_DIR = Path(__file__).resolve().parents[1]
+from tests.support import alembic_config
 
 # Key columns per table, verbatim from the PRD data model.
 PRD_TABLES: dict[str, set[str]] = {
@@ -67,11 +63,7 @@ PRD_TABLES: dict[str, set[str]] = {
 COMMON = {"id", "created_at", "updated_at"}
 
 
-def _alembic_config(url: str | None = None) -> Config:
-    cfg = Config(str(API_DIR / "alembic.ini"))
-    if url:
-        cfg.set_main_option("sqlalchemy.url", url.replace("%", "%%"))
-    return cfg
+_alembic_config = alembic_config
 
 
 # --- always-on tests -------------------------------------------------------
@@ -134,17 +126,6 @@ def test_p1_offline_migration_sql_creates_all_tables(capsys: pytest.CaptureFixtu
 
 
 # --- tests against a real PostgreSQL + pgvector ----------------------------
-
-
-@pytest.fixture
-def migrated(database_url: str) -> Iterator[Engine]:
-    cfg = _alembic_config(database_url)
-    command.downgrade(cfg, "base")
-    command.upgrade(cfg, "head")
-    engine = create_engine(database_url)
-    yield engine
-    engine.dispose()
-    command.downgrade(cfg, "base")
 
 
 @pytest.mark.db

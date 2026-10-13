@@ -9,7 +9,7 @@ from app import __version__
 from app.config import get_settings
 from app.errors import register_error_handlers
 from app.readiness import ReadinessRegistry, default_registry
-from app.routers import health
+from app.routers import health, webhooks
 
 API_V1_PREFIX = "/api/v1"
 
@@ -36,6 +36,7 @@ def create_app(readiness: ReadinessRegistry | None = None) -> FastAPI:
     )
     register_error_handlers(app)
     app.include_router(health.router)
+    app.include_router(webhooks.router)
     return app
 
 

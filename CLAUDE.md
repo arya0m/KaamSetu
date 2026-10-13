@@ -9,7 +9,8 @@ work one build-plan phase per session and follow the session rules in PRD.md
 | Phase | State |
 | --- | --- |
 | 1. Foundation | Done locally (2026-10-13): `docker compose up` brings all 4 services up healthy and `/readyz` is green. All 45 tests pass on Python 3.12 installed from the hash-pinned dev lock, including the `db` tests (99% coverage), the Celery ping round-trips, the API stops in about 1 s, and pip-audit is clean. **CI has not run on GitHub yet** |
-| 2–7 | Not started |
+| 2. WhatsApp loop | Code complete (2026-10-13). 261 tests pass on Python 3.12 against real Postgres (97% coverage). An end-to-end run through the live stack with a fake Twilio API completed Hindi and English onboarding, a Telugu decline (zero rows stored) and duplicate suppression, with a worst webhook latency of 85 ms. **The done-when is still open:** a real Twilio sandbox number has not completed onboarding yet (needs your Twilio credentials and a public HTTPS URL, see "Connecting the Twilio sandbox") |
+| 3–7 | Not started |
 
 ## What Phase 1 built
 
@@ -55,6 +56,50 @@ work one build-plan phase per session and follow the session rules in PRD.md
 - **FR-14:** the job form has **shifts**, but `jobs` has no shifts column.
 - **Match score (Phase 5):** experience fit needs the job's **minimum years**, but `jobs` has no such column.
 - **FR-17:** "median time to first interest" may need an interest timestamp. `applications.created_at` might be enough.
+
+## What Phase 2 built (WhatsApp loop, FR-1)
+
+### Decisions that deviate from PRD.md (made with the user, 2026-10-13)
+
+- **Provider:** the Twilio WhatsApp sandbox, not Meta's Cloud API. This changes the PRD's webhook spec:
+  - **Signature:** requests are signed with `X-Twilio-Signature` (HMAC-SHA1 over the public URL plus the sorted form parameters), not `X-Hub-Signature-256`.
+  - **No GET handshake:** `GET /webhooks/whatsapp` returns 405.
+  - **Delivery statuses** arrive on `POST /webhooks/whatsapp/status`.
+  - **Swappable:** the provider sits behind `WhatsAppProvider`, so a Meta provider can be added later.
+- **Numbered menus, not buttons:** the sandbox can't send custom templates, so it can't send quick-reply buttons ([Twilio sandbox docs](https://www.twilio.com/docs/whatsapp/sandbox)). Workers reply with a number, which can be in their own script's digits ("१", "৩"), or with a word ("हाँ", "yes", a language name). Buttons can come back once there's a registered WhatsApp sender.
+- **13 languages instead of 3:** Hindi, English, Bengali, Marathi, Telugu, Tamil, Gujarati, Kannada, Malayalam, Odia, Punjabi, Assamese and Urdu. **A native speaker should review the translations** before the demo; they live in `app/i18n/locales/*.json`.
+- **Pre-consent state lives in Redis only:** the step and chosen language are stored under `onboard:<phone hash>` with `PRECONSENT_TTL_S` (24 h). Nothing touches Postgres until "I agree"; declining deletes the key.
+- **Phone numbers stored as plaintext until Phase 7**, per the user's choice. `wa_phone_hash` is HMAC-SHA256 with the secret `PHONE_HASH_SALT`; never change the salt once workers exist. `wa_phone_encrypted` holds the plaintext via `PlaintextPhoneCodec`. **Production refuses to start** while `PHONE_ENCRYPTION=none`.
+
+### Code
+
+- **`app/routers/webhooks.py`:** checks the body size, parses the form, verifies the signature against `PUBLIC_BASE_URL` + path, claims the message ID in Redis, queues the work and returns empty TwiML.
+  - **Malformed but signed requests** get a 200 and are dropped, so Twilio doesn't retry garbage.
+  - **Queueing failures** get a 503 and release the claim, so Twilio's retry goes through.
+- **`app/services/whatsapp.py`:** the `WhatsAppProvider` protocol, `TwilioProvider` (httpx; classifies errors as transient or permanent and never logs phone numbers or text) and `SendThrottle`, which spaces sends via Redis to respect the sandbox's 1 message per 3 s (`WHATSAPP_MIN_SEND_INTERVAL_MS`).
+- **`app/services/conversation.py`:** a pure state machine: new → awaiting_language → awaiting_consent → active (echo). Each inbound message produces exactly one reply, which suits the sandbox's rate limit.
+- **`app/services/inbound.py`:** applies an outcome to Redis and Postgres.
+  - **On consent** it creates the worker (with `consent_at`), writes an `audit_log` entry and starts logging messages.
+  - **Duplicates** are caught twice: the Redis claim, then `messages.wa_message_id` UNIQUE with `ON CONFLICT DO NOTHING`.
+  - **Concurrent "yes" messages** create only one worker.
+- **`app/workers/tasks.py`:**
+  - `handle_inbound` computes the reply and queues `send_text`.
+  - `send_text` sends with retries: 3 attempts, exponential backoff with jitter.
+  - `update_message_status` applies delivery-status callbacks.
+- **`app/i18n/`:** `t()`, the bilingual welcome (Hindi and English, privacy link, numbered menu of all 13 languages, under 300 characters), and language and consent matching.
+- **Tests (`test_fr1_*` / `test_p2_*`):**
+  - **Coverage:** i18n completeness and 300-character limits for every key in every language, every state-machine transition, the Twilio signature cross-checked against Twilio's official SDK, exact send payloads, and retry classification.
+  - **Webhook behaviour:** the throttle, rejecting bad signatures, de-duplication, and the 503 that releases the claim.
+  - **Full DB flows in Hindi and English:** declining stores zero rows, the TTL is set, duplicates are suppressed after consent, concurrent consent creates one worker, the status callback updates the row, and sending succeeds on the 3rd attempt or gives up after 3.
+  - **Guard:** a test fails if non-ASCII (worker-facing) text appears in app code outside `app/i18n`.
+
+### Connecting the Twilio sandbox (the remaining done-when)
+
+1. **Join the sandbox:** in the Twilio Console, go to Messaging → Try it out → Send a WhatsApp message, and join from each test phone by sending the shown `join <code>` message.
+2. **Expose the API publicly over HTTPS:** for example `cloudflared tunnel --url http://localhost:8000` or `ngrok http 8000`.
+3. **Fill in `.env`:** set `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `PUBLIC_BASE_URL=<tunnel URL>` and `WHATSAPP_MIN_SEND_INTERVAL_MS=3000`, then run `docker compose up -d`.
+4. **Set the webhook:** under Sandbox settings, set "When a message comes in" to `<tunnel URL>/webhooks/whatsapp` (POST). It must match `PUBLIC_BASE_URL` exactly, or every signature check fails with 403.
+5. **Check:** onboard one phone in Hindi and one in English.
 
 ## How to run
 
