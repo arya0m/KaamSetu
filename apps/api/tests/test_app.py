@@ -1,6 +1,7 @@
 """P1-foundation: app wiring, OpenAPI docs, CORS, DB session, Celery."""
 
 from collections.abc import Iterator
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -53,6 +54,30 @@ def test_p1_get_session_yields_working_session_and_closes() -> None:
     assert session.execute(text("SELECT 1")).scalar_one() == 1
     with pytest.raises(StopIteration):
         next(gen)
+
+
+def test_p1_postgres_engine_has_pool_and_connect_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_create_engine(url: Any, **kwargs: Any) -> str:
+        captured.update(kwargs, url=str(url))
+        return "engine"
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://u:p@db:5432/x")
+    monkeypatch.setenv("DB_POOL_SIZE", "7")
+    monkeypatch.setenv("DB_CONNECT_TIMEOUT_S", "3")
+    monkeypatch.setattr(db, "create_engine", fake_create_engine)
+    get_settings.cache_clear()
+    db.get_engine.cache_clear()
+    try:
+        db.get_engine()
+    finally:
+        get_settings.cache_clear()
+        db.get_engine.cache_clear()
+    assert captured["pool_pre_ping"] is True
+    assert captured["pool_size"] == 7
+    assert captured["max_overflow"] == 10
+    assert captured["connect_args"]["connect_timeout"] == 3
 
 
 def test_p1_celery_ping_task_runs() -> None:

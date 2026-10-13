@@ -1,19 +1,26 @@
 # Local stack: `cp .env.example .env`, fill in secrets, then `docker compose up --build`.
 name: kaamsetu
 
-x-api-image: &api-image
+# Shared by api, worker and migrate (one image, different commands).
+x-app: &app
   build: ./apps/api
   image: kaamsetu-api:local
   env_file: .env
-  depends_on:
-    postgres:
-      condition: service_healthy
-    redis:
-      condition: service_healthy
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp
+  security_opt:
+    - no-new-privileges:true
+
+x-hardened: &hardened
+  security_opt:
+    - no-new-privileges:true
   restart: unless-stopped
 
 services:
   postgres:
+    <<: *hardened
     image: pgvector/pgvector:pg16
     environment:
       POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
@@ -28,10 +35,14 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
-    restart: unless-stopped
 
   redis:
+    <<: *hardened
     image: redis:7-alpine
+    # Append-only file so queued tasks survive a Redis restart.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
     ports:
       - "127.0.0.1:6379:6379"
     healthcheck:
@@ -39,30 +50,49 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
-    restart: unless-stopped
+
+  # One-shot: applies migrations once, before api/worker start. Running them inside
+  # the api command would race when the api is scaled to several replicas.
+  migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    healthcheck:
+      disable: true
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   api:
-    <<: *api-image
-    # Migrations run on start so /readyz sees the pgvector extension and tables.
-    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    <<: *app
+    restart: unless-stopped
+    stop_grace_period: 30s
     ports:
       - "127.0.0.1:8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
 
   worker:
-    <<: *api-image
-    command: celery -A app.workers.celery_app worker --loglevel=INFO --concurrency=2
+    <<: *app
+    restart: unless-stopped
+    # Celery finishes in-flight tasks on SIGTERM (warm shutdown); give it time.
+    stop_grace_period: 60s
+    command: ["celery", "-A", "app.workers.celery_app", "worker", "--loglevel=INFO", "--concurrency=2"]
     healthcheck:
       test: ["CMD-SHELL", "celery -A app.workers.celery_app inspect ping -d celery@$$HOSTNAME -t 5"]
       interval: 30s
       timeout: 10s
+      start_period: 20s
       retries: 3
     depends_on:
-      api:
-        condition: service_started
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
 
 volumes:
   pgdata:
+  redisdata:
