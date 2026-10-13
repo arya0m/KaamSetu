@@ -73,3 +73,82 @@ def test_p1_default_checks_fail_when_services_unreachable() -> None:
     # conftest points DATABASE_URL/REDIS_URL at port 1 unless real test services are set.
     results = default_registry().run()
     assert results == {"database": "fail", "pgvector": "fail", "redis": "fail"}
+
+
+def test_p3_provider_checks_registered_only_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.config import get_settings
+
+    assert "llm" not in default_registry().names and "stt" not in default_registry().names
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
+    monkeypatch.setenv("WATSON_STT_API_KEY", "w")
+    monkeypatch.setenv("WATSON_STT_URL", "https://stt.example")
+    get_settings.cache_clear()
+    try:
+        assert default_registry().names == ["database", "pgvector", "redis", "stt", "llm"]
+        monkeypatch.setenv("LLM_PROVIDER", "watsonx")
+        monkeypatch.setenv("WATSONX_API_KEY", "ibm")
+        get_settings.cache_clear()
+        assert "llm" in default_registry().names
+    finally:
+        get_settings.cache_clear()
+
+
+def test_p3_provider_checks_are_cached_while_passing() -> None:
+    from app.readiness import cached
+
+    calls: list[int] = []
+    now = [0.0]
+    check = cached(lambda: calls.append(1), ttl_s=60, clock=lambda: now[0])
+    check()
+    check()
+    assert len(calls) == 1
+    now[0] = 61
+    check()
+    assert len(calls) == 2
+
+
+def test_p3_failing_provider_check_is_not_cached() -> None:
+    from app.readiness import cached
+
+    calls: list[int] = []
+
+    def down() -> None:
+        calls.append(1)
+        raise RuntimeError("401")
+
+    check = cached(down, ttl_s=60)
+    for _ in range(2):
+        with pytest.raises(RuntimeError):
+            check()
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("fn", "env"),
+    [
+        ("check_openai", {"OPENAI_API_KEY": "sk"}),
+        ("check_watsonx", {"WATSONX_API_KEY": "k"}),
+        ("check_watson_stt", {"WATSON_STT_API_KEY": "k", "WATSON_STT_URL": "https://stt.example"}),
+    ],
+)
+def test_p3_provider_checks_fail_on_http_errors(
+    fn: str, env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import httpx
+
+    from app import readiness
+    from app.config import get_settings
+
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    get_settings.cache_clear()
+    statuses = iter([200, 401])
+    monkeypatch.setattr(httpx, "request", lambda *a, **k: httpx.Response(next(statuses)))
+    try:
+        getattr(readiness, fn)()  # 200 passes
+        with pytest.raises(RuntimeError, match="401"):
+            getattr(readiness, fn)()
+    finally:
+        get_settings.cache_clear()

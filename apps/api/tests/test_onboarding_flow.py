@@ -4,24 +4,18 @@ Runs against a real PostgreSQL (TEST_DATABASE_URL); Redis is fakeredis and
 Celery runs eagerly, so the whole loop happens inside one test.
 """
 
-from collections.abc import Iterator
-from itertools import count
-
-import fakeredis
 import pytest
-from fastapi.testclient import TestClient
-from sqlalchemy import Engine, func, select, text
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app import i18n
 from app.config import get_settings
-from app.db import get_engine, get_sessionmaker
 from app.models import AuditLog, Message, MessageDirection, Worker
 from app.services.inbound import preconsent_key
 from app.services.phone import hash_phone
 from app.workers import tasks
 from app.workers.celery_app import celery_app
-from tests.conftest import FakeWhatsApp, signed_post, twilio_inbound
+from tests.conftest import Loop, signed_post
 
 pytestmark = pytest.mark.db
 
@@ -33,50 +27,6 @@ ALL_TABLES = (
     "workers", "worker_profiles", "voice_notes", "employers", "jobs",
     "matches", "applications", "courses", "messages", "audit_log",
 )  # fmt: skip
-
-
-@pytest.fixture
-def loop(
-    migrated: Engine,
-    client: TestClient,
-    fake_redis: fakeredis.FakeRedis,
-    fake_whatsapp: FakeWhatsApp,
-    eager_celery: None,
-) -> Iterator["Loop"]:
-    get_engine.cache_clear()
-    get_sessionmaker.cache_clear()
-    yield Loop(client, fake_whatsapp, fake_redis, migrated)
-    get_engine().dispose()
-    get_engine.cache_clear()
-    get_sessionmaker.cache_clear()
-
-
-class Loop:
-    def __init__(
-        self, client: TestClient, wa: FakeWhatsApp, r: fakeredis.FakeRedis, engine: Engine
-    ) -> None:
-        self.client, self.wa, self.redis, self.engine = client, wa, r, engine
-        self._ids = count(1)
-
-    def send(self, phone: str, body: str = "", num_media: int = 0, sid: str | None = None) -> str:
-        sid = sid or f"SM{next(self._ids):032d}"
-        resp = signed_post(self.client, PATH, twilio_inbound(sid, phone, body, num_media))
-        assert resp.status_code == 200, resp.text
-        return sid
-
-    def last_reply(self, phone: str) -> str:
-        return self.wa.bodies_to(phone)[-1]
-
-    def rows(self, table: str) -> int:
-        with self.engine.connect() as conn:
-            return int(conn.execute(text(f"SELECT count(*) FROM {table}")).scalar_one())  # noqa: S608
-
-    def total_rows(self) -> int:
-        return sum(self.rows(t) for t in ALL_TABLES)
-
-    def worker(self, phone: str) -> Worker | None:
-        with Session(self.engine) as s:
-            return s.scalar(select(Worker).where(Worker.wa_phone_hash == hash_phone(phone)))
 
 
 @pytest.mark.parametrize(
@@ -94,12 +44,12 @@ def test_fr1_onboarding_completes(
     assert loop.total_rows() == 0, "FR-1: nothing stored before consent"
 
     loop.send(phone, agree)
-    assert loop.last_reply(phone) == i18n.t("consent_thanks", language)
+    assert loop.last_reply(phone) == i18n.consent_granted(language, voice_ok=True)
 
     worker = loop.worker(phone)
     assert worker is not None
     assert worker.language == language
-    assert worker.state == "active"
+    assert worker.state == "awaiting_description"
     assert worker.consent_at is not None
     assert worker.wa_phone_hash != phone and phone not in worker.wa_phone_hash
     assert loop.redis.get(preconsent_key(hash_phone(phone))) is None
@@ -112,8 +62,8 @@ def test_fr1_onboarding_completes(
         directions = s.scalars(select(Message.direction).order_by(Message.created_at)).all()
         assert directions == [MessageDirection.INBOUND, MessageDirection.OUTBOUND]
 
-    loop.send(phone, "काम चाहिए")
-    assert loop.last_reply(phone) == i18n.echo("काम चाहिए", language)
+    loop.send(phone, "मैं wiring का काम करता हूँ")
+    assert loop.last_reply(phone).startswith(i18n.t("summary_title", language))
 
 
 def test_fr1_decline_stores_nothing(loop: Loop) -> None:
@@ -153,10 +103,11 @@ def test_p2_duplicate_delivery_processed_once(loop: Loop) -> None:
 def test_p2_duplicate_after_consent_is_ignored_by_db_unique(loop: Loop) -> None:
     for body in ("hi", "2", "1"):
         loop.send(ENGLISH_PHONE, body)
-    loop.send(ENGLISH_PHONE, "echo me", sid="SM_AGAIN")
+    before = len(loop.wa.bodies_to(ENGLISH_PHONE))
+    loop.send(ENGLISH_PHONE, "I do wiring", sid="SM_AGAIN")
     loop.redis.delete("wa:seen:SM_AGAIN")  # simulate the Redis claim expiring or being lost
-    loop.send(ENGLISH_PHONE, "echo me", sid="SM_AGAIN")
-    assert loop.wa.bodies_to(ENGLISH_PHONE).count(i18n.echo("echo me", "en")) == 1
+    loop.send(ENGLISH_PHONE, "I do wiring", sid="SM_AGAIN")
+    assert len(loop.wa.bodies_to(ENGLISH_PHONE)) == before + 1
 
 
 def test_p2_workers_are_isolated(loop: Loop) -> None:

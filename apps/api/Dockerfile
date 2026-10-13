@@ -23,6 +23,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     # Trust X-Forwarded-* only from these proxies; set to the load balancer's range.
     FORWARDED_ALLOW_IPS=127.0.0.1
 
+# ffmpeg converts WhatsApp OGG/Opus voice notes to 16 kHz WAV for speech-to-text (FR-2).
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN groupadd --system --gid 10001 app \
     && useradd --system --uid 10001 --gid app --no-create-home --home-dir /nonexistent app
 

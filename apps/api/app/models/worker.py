@@ -44,7 +44,8 @@ class VoiceNote(TimestampedBase):
     worker_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("workers.id", ondelete="CASCADE"), index=True
     )
-    media_url: Mapped[str] = mapped_column(Text)
+    # NULL for typed text: FR-2 accepts text too, and every input is a transcript.
+    media_url: Mapped[str | None] = mapped_column(Text)
     transcript: Mapped[str | None] = mapped_column(Text)
     language: Mapped[str | None] = mapped_column(String(8))
     duration_s: Mapped[float | None] = mapped_column(Float)

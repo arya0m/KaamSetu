@@ -9,7 +9,10 @@ import json
 import unicodedata
 from functools import cache
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from app.schemas.profile import WorkerProfileData
 
 LOCALES_DIR = Path(__file__).parent / "locales"
 
@@ -25,13 +28,34 @@ PER_LANGUAGE_KEYS = (
     "consent_invalid",
     "consent_thanks",
     "consent_declined",
-    "echo",
     "unsupported_media",
+    "describe_work_voice",
+    "describe_work_text",
+    "voice_listening",
+    "voice_too_long",
+    "voice_failed",
+    "voice_type_instead",
+    "followup_primary_trade",
+    "followup_years_experience",
+    "followup_location",
+    "summary_title",
+    "label_trade",
+    "label_skills",
+    "label_experience",
+    "label_location",
+    "years_value",
+    "not_given",
+    "confirm_options",
+    "confirm_invalid",
+    "change_prompt",
+    "profile_confirmed",
+    "try_again_later",
 )
 PRE_LANGUAGE_KEYS = ("welcome", "choose_language", "language_invalid")
 WELCOME_LANGUAGES = ("hi", "en")
 
-ECHO_MAX_CHARS = 200
+MAX_MESSAGE_CHARS = 300  # PRD Accessibility: worker messages under 300 characters
+SUMMARY_MAX_SKILLS = 5
 
 
 @cache
@@ -70,9 +94,62 @@ def language_retry() -> str:
     return f"{header}\n{_menu()}"
 
 
-def echo(text: str, language: str) -> str:
-    clipped = text if len(text) <= ECHO_MAX_CHARS else text[: ECHO_MAX_CHARS - 1] + "…"
-    return t("echo", language, text=clipped)
+def describe_work(language: str, voice_ok: bool) -> str:
+    return t("describe_work_voice" if voice_ok else "describe_work_text", language)
+
+
+def consent_granted(language: str, voice_ok: bool) -> str:
+    """One message after "I agree": thanks plus what to send next (sandbox: 1 msg/step)."""
+    return f"{t('consent_thanks', language)}\n{describe_work(language, voice_ok)}"
+
+
+def follow_up(field: str, language: str) -> str:
+    return t(f"followup_{field}", language)
+
+
+def trade_name(trade: str, language: str) -> str:
+    code = language if language in LANGUAGE_CODES else "en"
+    name: str = _locale(code)["trades"][trade]
+    return name
+
+
+def _years(value: float) -> str:
+    return f"{value:g}"
+
+
+def profile_summary(profile: "WorkerProfileData", language: str) -> str:
+    """FR-5: short profile summary with the Correct / Change options."""
+    not_given = t("not_given", language)
+    loc = profile.location
+    place = ", ".join(p for p in (loc.area, loc.city) if p)
+    if loc.pincode:
+        place = f"{place} {loc.pincode}".strip()
+    years = (
+        t("years_value", language, years=_years(profile.years_experience))
+        if profile.years_experience is not None
+        else not_given
+    )
+
+    def render(skill_count: int) -> str:
+        skills = ", ".join(s.name for s in profile.skills[:skill_count]) or not_given
+        return "\n".join(
+            [
+                t("summary_title", language),
+                f"{t('label_trade', language)}: {trade_name(profile.primary_trade, language)}",
+                f"{t('label_skills', language)}: {skills}",
+                f"{t('label_experience', language)}: {years}",
+                f"{t('label_location', language)}: {place or not_given}",
+                "",
+                t("confirm_options", language),
+            ]
+        )
+
+    count = min(SUMMARY_MAX_SKILLS, len(profile.skills))
+    text = render(count)
+    while len(text) >= MAX_MESSAGE_CHARS and count > 1:
+        count -= 1
+        text = render(count)
+    return text
 
 
 def _normalize(text: str) -> str:
@@ -101,7 +178,10 @@ def match_language(text: str | None) -> str | None:
 
 
 def parse_consent(text: str | None, language: str) -> bool | None:
-    """True for agree, False for decline, None if unclear. "1"/"2" work everywhere."""
+    """True for yes/agree/correct, False for no/change, None if unclear.
+
+    "1" and "2" work in every language; used for consent and for confirmation.
+    """
     if not text:
         return None
     answer = _normalize(text)

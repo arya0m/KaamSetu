@@ -10,6 +10,7 @@ otherwise, or fail if REQUIRE_DB_TESTS=1.
 import os
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 from urllib.parse import urlencode
 
 import pytest
@@ -28,17 +29,26 @@ os.environ["PUBLIC_BASE_URL"] = "https://api.kaamsetu.test"
 os.environ["PRIVACY_NOTICE_URL"] = "https://kaamsetu.test/privacy"
 os.environ["WHATSAPP_MIN_SEND_INTERVAL_MS"] = "0"
 
+from itertools import count
+
 import fakeredis
 import httpx
 from alembic import command
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine, create_engine
+from sqlalchemy import Engine, create_engine, select, text
+from sqlalchemy.orm import Session
 
+from app.db import get_engine, get_sessionmaker
 from app.main import create_app
+from app.models import Worker
 from app.readiness import ReadinessRegistry
 from app.routers import webhooks
 from app.schemas.whatsapp import InboundMessage, StatusUpdate
+from app.services.phone import hash_phone
 from app.services.whatsapp import Params, TwilioProvider, twilio_signature
+
+if TYPE_CHECKING:
+    from app.ai.llm import LLMResponse
 from app.workers import tasks
 from app.workers.celery_app import celery_app
 from tests.support import alembic_config
@@ -122,6 +132,15 @@ class FakeWhatsApp:
         self.sent.append((to_phone, body))
         return f"SMOUT{len(self.sent):027d}"  # never collides with inbound test IDs
 
+    media: dict[str, bytes] = field(default_factory=dict)
+
+    def fetch_media(self, url: str, max_bytes: int) -> bytes:
+        from app.services.whatsapp import MediaError
+
+        if url not in self.media:
+            raise MediaError("not found")
+        return self.media[url]
+
     def bodies_to(self, phone: str) -> list[str]:
         return [body for to, body in self.sent if to == phone]
 
@@ -168,15 +187,180 @@ def signed_post(
     return response
 
 
-def twilio_inbound(sid: str, phone: str, body: str = "", num_media: int = 0) -> dict[str, str]:
+def twilio_inbound(
+    sid: str, phone: str, body: str = "", num_media: int = 0, media_url: str | None = None
+) -> dict[str, str]:
+    media = {"MediaUrl0": media_url, "MediaContentType0": "audio/ogg"} if media_url else {}
     return {
+        **media,
         "MessageSid": sid,
         "SmsMessageSid": sid,
         "AccountSid": "AC" + "0" * 32,
         "From": f"whatsapp:{phone}",
         "To": "whatsapp:+14155238886",
         "Body": body,
-        "NumMedia": str(num_media),
+        "NumMedia": str(num_media or (1 if media_url else 0)),
         "ProfileName": "Test Worker",
         "WaId": phone.lstrip("+"),
     }
+
+
+# --- AI fakes (FR-2 / FR-3) ----------------------------------------------------
+
+
+def profile_json(**overrides: object) -> str:
+    """A valid LLM extraction reply; evidence must quote the transcript."""
+    import json
+
+    data: dict[str, object] = {
+        "name": None,
+        "primary_trade": "electrician",
+        "skills": [{"name": "house wiring", "level": "expert", "evidence": "wiring"}],
+        "years_experience": 8,
+        "location": {"city": "Delhi", "area": "Laxmi Nagar", "pincode": None},
+        "languages_spoken": ["Hindi"],
+        "availability": "full_time",
+        "expected_daily_pay_inr": 800,
+        "missing_fields": [],
+        "confidence": 0.9,
+    }
+    data.update(overrides)
+    return json.dumps(data, ensure_ascii=False)
+
+
+@dataclass
+class FakeLLM:
+    """Returns scripted replies in order (the last one repeats) and records prompts."""
+
+    replies: list[str] = field(default_factory=lambda: [profile_json()])
+    calls: list[list[dict[str, str]]] = field(default_factory=list)
+    provider: str = "fake"
+    model: str = "fake-1"
+
+    def complete_json(
+        self, messages: list[dict[str, str]], schema: dict[str, object], schema_name: str
+    ) -> "LLMResponse":
+        from app.ai.llm import LLMResponse
+
+        self.calls.append(messages)
+        reply = self.replies[min(len(self.calls), len(self.replies)) - 1]
+        return LLMResponse(reply, 100, 50)
+
+    def user_payload(self, call: int = -1) -> dict[str, object]:
+        import json
+
+        payload: dict[str, object] = json.loads(self.calls[call][1]["content"])
+        return payload
+
+
+@dataclass
+class FakeSTT:
+    """Watson's language coverage; transcripts are scripted."""
+
+    transcripts: list[str] = field(default_factory=lambda: ["mai bijli ka kaam karta hoon, wiring"])
+    provider: str = "fake-stt"
+    calls: int = 0
+
+    def supports(self, language: str) -> bool:
+        return language in ("hi", "en")
+
+    def transcribe(self, wav: bytes, language: str) -> tuple[str, float | None]:
+        self.calls += 1
+        return self.transcripts[min(self.calls, len(self.transcripts)) - 1], 0.9
+
+
+@pytest.fixture
+def fake_llm(monkeypatch: pytest.MonkeyPatch) -> FakeLLM:
+    from app.services import inbound
+
+    llm = FakeLLM()
+    monkeypatch.setattr(inbound, "get_llm", lambda: llm)
+    return llm
+
+
+@pytest.fixture
+def fake_stt(monkeypatch: pytest.MonkeyPatch) -> FakeSTT:
+    """Fake STT plus a fake ffmpeg step, so flow tests do not need ffmpeg."""
+    from app.ai.stt import AudioTooLong, Transcript
+    from app.services import inbound
+
+    stt = FakeSTT()
+    monkeypatch.setattr(inbound, "get_stt", lambda: stt)
+
+    def fake_transcribe(engine: FakeSTT, audio: bytes, language: str) -> Transcript:
+        if audio == b"TOO-LONG":
+            raise AudioTooLong(150.0)
+        text, confidence = engine.transcribe(b"wav", language)
+        return Transcript(text, language, 12.0, confidence)
+
+    monkeypatch.setattr(inbound, "transcribe_audio", fake_transcribe)
+    return stt
+
+
+# --- end-to-end loop over the webhook (db tests) ---------------------------------
+
+ALL_TABLES = (
+    "workers", "worker_profiles", "voice_notes", "employers", "jobs",
+    "matches", "applications", "courses", "messages", "audit_log",
+)  # fmt: skip
+
+
+@pytest.fixture
+def loop(
+    migrated: Engine,
+    client: TestClient,
+    fake_redis: fakeredis.FakeRedis,
+    fake_whatsapp: FakeWhatsApp,
+    fake_llm: FakeLLM,
+    fake_stt: FakeSTT,
+    eager_celery: None,
+) -> Iterator["Loop"]:
+    get_engine.cache_clear()
+    get_sessionmaker.cache_clear()
+    yield Loop(client, fake_whatsapp, fake_redis, migrated, fake_llm, fake_stt)
+    get_engine().dispose()
+    get_engine.cache_clear()
+    get_sessionmaker.cache_clear()
+
+
+class Loop:
+    def __init__(
+        self,
+        client: TestClient,
+        wa: FakeWhatsApp,
+        r: fakeredis.FakeRedis,
+        engine: Engine,
+        llm: "FakeLLM",
+        stt: "FakeSTT",
+    ) -> None:
+        self.client, self.wa, self.redis, self.engine = client, wa, r, engine
+        self.llm, self.stt = llm, stt
+        self._ids = count(1)
+
+    def send(
+        self,
+        phone: str,
+        body: str = "",
+        num_media: int = 0,
+        sid: str | None = None,
+        media_url: str | None = None,
+    ) -> str:
+        sid = sid or f"SM{next(self._ids):032d}"
+        params = twilio_inbound(sid, phone, body, num_media, media_url)
+        resp = signed_post(self.client, "/webhooks/whatsapp", params)
+        assert resp.status_code == 200, resp.text
+        return sid
+
+    def last_reply(self, phone: str) -> str:
+        return self.wa.bodies_to(phone)[-1]
+
+    def rows(self, table: str) -> int:
+        with self.engine.connect() as conn:
+            return int(conn.execute(text(f"SELECT count(*) FROM {table}")).scalar_one())  # noqa: S608
+
+    def total_rows(self) -> int:
+        return sum(self.rows(t) for t in ALL_TABLES)
+
+    def worker(self, phone: str) -> Worker | None:
+        with Session(self.engine) as s:
+            return s.scalar(select(Worker).where(Worker.wa_phone_hash == hash_phone(phone)))

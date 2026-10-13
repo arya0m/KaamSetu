@@ -36,7 +36,16 @@ def test_p2_signed_message_is_queued_and_acknowledged(
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/xml")
     assert "<Response>" in resp.text
-    assert queued == [{"message_id": "SM1", "from_phone": PHONE, "text": "hello", "media_count": 0}]
+    assert queued == [
+        {
+            "message_id": "SM1",
+            "from_phone": PHONE,
+            "text": "hello",
+            "media_count": 0,
+            "media_url": None,
+            "media_type": None,
+        }
+    ]
 
 
 @pytest.mark.usefixtures("fake_redis", "fake_whatsapp")

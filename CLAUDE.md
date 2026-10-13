@@ -10,7 +10,8 @@ work one build-plan phase per session and follow the session rules in PRD.md
 | --- | --- |
 | 1. Foundation | Done locally (2026-10-13): `docker compose up` brings all 4 services up healthy and `/readyz` is green. All 45 tests pass on Python 3.12 installed from the hash-pinned dev lock, including the `db` tests (99% coverage), the Celery ping round-trips, the API stops in about 1 s, and pip-audit is clean. **CI has not run on GitHub yet** |
 | 2. WhatsApp loop | Code complete (2026-10-13). 261 tests pass on Python 3.12 against real Postgres (97% coverage). An end-to-end run through the live stack with a fake Twilio API completed Hindi and English onboarding, a Telugu decline (zero rows stored) and duplicate suppression, with a worst webhook latency of 85 ms. **The done-when is still open:** a real Twilio sandbox number has not completed onboarding yet (needs your Twilio credentials and a public HTTPS URL, see "Connecting the Twilio sandbox") |
-| 3–7 | Not started |
+| 3. Voice to profile | Code complete (2026-10-13). FR-2 to FR-5 run end to end with fake STT and LLM, plus real ffmpeg and real Postgres. **The done-when is still open:** the 30-case evaluation set (`python -m app.ai.evaluation`) has not been run against a real LLM, because it needs `OPENAI_API_KEY`. Watson STT and watsonx Granite are also unverified against live APIs |
+| 4–7 | Not started |
 
 ## What Phase 1 built
 
@@ -100,6 +101,52 @@ work one build-plan phase per session and follow the session rules in PRD.md
 3. **Fill in `.env`:** set `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `PUBLIC_BASE_URL=<tunnel URL>` and `WHATSAPP_MIN_SEND_INTERVAL_MS=3000`, then run `docker compose up -d`.
 4. **Set the webhook:** under Sandbox settings, set "When a message comes in" to `<tunnel URL>/webhooks/whatsapp` (POST). It must match `PUBLIC_BASE_URL` exactly, or every signature check fails with 403.
 5. **Check:** onboard one phone in Hindi and one in English.
+
+## What Phase 3 built (voice to profile, FR-2 to FR-5)
+
+### Decisions that deviate from PRD.md (made with the user, 2026-10-13)
+
+- **STT is IBM Watson only.** Its Indian models are `hi-IN_Telephony` and `en-IN_Telephony`, so **voice notes work in Hindi and English only** ([IBM next-gen models](https://cloud.ibm.com/docs/speech-to-text?topic=speech-to-text-models-ng)).
+  - **Other languages:** workers who chose one of the other 11 are told voice isn't available and asked to type. FR-2 accepts text.
+  - **Whisper:** the PRD's Whisper provider wasn't built (the user declined it); `SpeechToText` is the seam for adding it.
+- **LLM defaults to OpenAI** (no watsonx credits yet).
+  - **API and model:** it uses the Responses API with a strict JSON schema, model `gpt-6-luna` (`OPENAI_MODEL`).
+  - **Granite:** a provider for Granite on watsonx.ai (`ibm/granite-4-h-small`, IAM token cached) is built; select it with `LLM_PROVIDER=watsonx`. IBM's public docs don't show the chat request body, so it follows the OpenAI-compatible shape the SDKs use. **Verify it with the smoke suite once credits exist.**
+- **Numbered replies again** (sandbox limitation): "1 = Correct, 2 = Change", with yes/no words accepted.
+- **`voice_notes.media_url` is nullable** (migration `0002`). Typed descriptions and follow-up answers are stored as transcripts too, so "combined transcript" (FR-5) covers every input.
+- **Conversation context is encoded in `workers.state`**, e.g. `follow_up:location:2` (field asked, follow-ups so far). No schema change was needed.
+- **Location is not geocoded yet:** city, area and pin code are stored as text with `lat`/`lng` null. Geocoding comes with distance matching in Phase 5.
+- **Audio is never stored by us:** we keep the Twilio media URL and the transcript. Twilio still holds the media; deleting it after 30 days (PRD) is a Phase 7 retention job.
+
+### Pipeline (all in the Celery worker)
+
+1. **Download:** `TwilioProvider.fetch_media` downloads the voice note with account auth. It only accepts `api.twilio.com` URLs (blocking server-side request forgery), caps size at `MEDIA_MAX_BYTES`, and retries 3 times.
+2. **Acknowledge:** the worker is sent "listening…" right away.
+3. **Convert:** `app/ai/stt.transcode_to_wav` converts any audio to 16 kHz mono WAV with ffmpeg (stdin to stdout, no temp files). Notes over `VOICE_MAX_SECONDS` (120) are rejected.
+4. **Transcribe:** `WatsonSTT` transcribes (3 attempts on transient errors), and the transcript is saved to `voice_notes`.
+5. **Extract:** `app/services/profile.extract_profile`:
+   - **Redact:** `app/ai/redact` strips phone, Aadhaar, PAN, voter-ID, passport and other 9+ digit numbers (any script's digits), keeping pin codes and pay.
+   - **Call the LLM:** with the combined transcript (newest 10 inputs), the previous profile and the field the latest message answers.
+   - **Validate and retry:** the output is validated with Pydantic. **On invalid output it retries once with the validation error**, then returns None, which falls back to a follow-up question (FR-3).
+   - **No invented skills:** the LLM must quote verbatim `evidence` for every skill, and skills whose quote isn't in the transcript are dropped in code. Evidence is stripped before storing.
+6. **Next step:**
+   - **Follow-ups (FR-4):** missing trade, experience or location get one follow-up question at a time, at most `MAX_FOLLOW_UPS` (3) per round.
+   - **Summary (FR-5):** otherwise the worker gets the summary (under 300 characters, translated labels and trade names), with 1 = Correct or 2 = Change.
+   - **Change** re-extracts on the combined transcript.
+   - **Correct** sets `worker_profiles.confirmed`.
+7. **Logging (PRD guardrail):** every LLM call logs provider, model, prompt ID and hash, character counts, tokens, latency and outcome. It **never logs the prompt or response text**, because they contain personal data.
+
+### Settings and readiness
+
+- **New settings:** `STT_*`/`WATSON_*`, `LLM_*`, `OPENAI_*`, `WATSONX_*`, `IBM_IAM_URL` and `MAX_FOLLOW_UPS`, all in `.env.example`. Production refuses to start without the selected provider's keys.
+- **`/readyz`:** adds `stt` and `llm` checks when they're configured. These call a free authenticated endpoint (model list or IAM token), cached for 60 seconds while passing.
+
+### AI evaluation set (the Phase 3 done-when)
+
+- **Data:** `seed/eval/profiles.jsonl` holds 30 synthetic cases: 10 Hindi (Devanagari and Hinglish), 10 Indian English, and 2 each in Bengali, Marathi, Tamil, Telugu and Gujarati. They cover all 8 trades and many cities.
+- **Run it:** `docker compose exec worker python -m app.ai.evaluation`, or from `apps/api` with `OPENAI_API_KEY` set. It prints per-case and per-language accuracy and exits non-zero if any of trade, skills or location is below 85% (`--min`). `--json report.json` saves details.
+- **Scoring:** documented in `app/ai/evaluation.py`. Predicted skills that match nothing expected are listed for human review.
+- **Unverified:** the cases and expected answers were written by Claude Code and need a team review. The run itself has **not** happened yet.
 
 ## How to run
 

@@ -36,6 +36,14 @@ class PermanentSendError(SendError):
     """Not worth retrying: bad request, unknown recipient, auth failure."""
 
 
+class MediaError(Exception):
+    """A media file could not be downloaded."""
+
+
+class TransientMediaError(MediaError):
+    """Provider 5xx or network error while downloading: worth retrying."""
+
+
 class WhatsAppProvider(Protocol):
     name: str
 
@@ -47,6 +55,10 @@ class WhatsAppProvider(Protocol):
 
     def send_text(self, to_phone: str, body: str, status_callback_url: str | None) -> str:
         """Send a text message; returns the provider's message ID."""
+        ...
+
+    def fetch_media(self, url: str, max_bytes: int) -> bytes:
+        """Download an inbound media file (e.g. a voice note)."""
         ...
 
 
@@ -92,11 +104,14 @@ class TwilioProvider:
     def parse_inbound(self, params: Params) -> InboundMessage:
         p = dict(params)
         body = p.get("Body", "").strip()
+        media_count = int(p.get("NumMedia", "0") or 0)
         return InboundMessage(
             message_id=p.get("MessageSid", ""),
             from_phone=self._phone(p.get("From", "")),
             text=body or None,
-            media_count=int(p.get("NumMedia", "0") or 0),
+            media_count=media_count,
+            media_url=p.get("MediaUrl0") or None if media_count else None,
+            media_type=p.get("MediaContentType0") or None if media_count else None,
         )
 
     def parse_status(self, params: Params) -> StatusUpdate:
@@ -122,6 +137,35 @@ class TwilioProvider:
             raise PermanentSendError(f"twilio HTTP {resp.status_code} code={code}")
         sid: str = resp.json()["sid"]
         return sid
+
+    def fetch_media(self, url: str, max_bytes: int) -> bytes:
+        """GET the media with account auth; Twilio redirects to a signed CDN URL.
+
+        Only URLs under the configured Twilio API base (https://api.twilio.com by
+        default) are fetched: the URL comes from the webhook, so this blocks
+        server-side request forgery. The body size is capped.
+        """
+        if not url.startswith(self._base + "/"):
+            raise MediaError("media URL is not a Twilio URL")
+        try:
+            with self._http.stream(
+                "GET", url, auth=(self._sid, self._token), follow_redirects=True
+            ) as resp:
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    raise TransientMediaError(f"twilio media HTTP {resp.status_code}")
+                if resp.status_code >= 400:
+                    raise MediaError(f"twilio media HTTP {resp.status_code}")
+                chunks, size = [], 0
+                for chunk in resp.iter_bytes():
+                    size += len(chunk)
+                    if size > max_bytes:
+                        raise MediaError("media file too large")
+                    chunks.append(chunk)
+        except httpx.TransportError as exc:
+            raise TransientMediaError(
+                f"twilio media transport error: {type(exc).__name__}"
+            ) from exc
+        return b"".join(chunks)
 
 
 @lru_cache

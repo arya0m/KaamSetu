@@ -13,7 +13,7 @@ from app.db import get_sessionmaker
 from app.models import Message, MessageDirection
 from app.redis import get_redis
 from app.schemas.whatsapp import InboundMessage, StatusUpdate
-from app.services.inbound import process_inbound
+from app.services.inbound import Deps, Outbound, process_inbound
 from app.services.whatsapp import SendThrottle, TransientSendError, get_provider
 from app.workers.celery_app import celery_app
 
@@ -33,17 +33,24 @@ def ping() -> str:
     return "pong"
 
 
+def _enqueue(out: Outbound) -> None:
+    send_text.delay(out.to_phone, out.body, str(out.worker_id) if out.worker_id else None)
+
+
 @celery_app.task(  # type: ignore[untyped-decorator]
     name="kaamsetu.handle_inbound",
     autoretry_for=(OperationalError, RedisConnectionError),
+    soft_time_limit=90,  # STT + LLM with retries; PRD target is a reply within 20 s
+    time_limit=120,
     **RETRY_POLICY,
 )
 def handle_inbound(message: dict[str, Any]) -> None:
     msg = InboundMessage.model_validate(message)
+    deps = Deps(provider=get_provider(), notify=_enqueue)
     with get_sessionmaker()() as session:
-        outbound = process_inbound(session, get_redis(), msg)
+        outbound = process_inbound(session, get_redis(), msg, deps)
     for out in outbound:
-        send_text.delay(out.to_phone, out.body, str(out.worker_id) if out.worker_id else None)
+        _enqueue(out)
 
 
 @celery_app.task(  # type: ignore[untyped-decorator]

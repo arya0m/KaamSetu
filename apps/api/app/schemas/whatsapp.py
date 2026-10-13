@@ -16,9 +16,17 @@ class InboundMessage(BaseModel):
     from_phone: str = Field(pattern=E164)
     text: str | None = Field(default=None, max_length=4096)
     media_count: int = Field(default=0, ge=0, le=10)
+    media_url: str | None = Field(default=None, max_length=1024, pattern=r"^https://")
+    media_type: str | None = Field(default=None, max_length=100)
+
+    @property
+    def is_audio(self) -> bool:
+        return bool(self.media_url and (self.media_type or "").startswith("audio/"))
 
     @property
     def kind(self) -> str:
+        if self.is_audio:
+            return "audio"
         return "media" if self.media_count else "text"
 
 

@@ -83,6 +83,9 @@ PROD_OK = {
     "TWILIO_AUTH_TOKEN": "real-token-from-vault",
     "TWILIO_WHATSAPP_FROM": "whatsapp:+14155238886",
     "PHONE_HASH_SALT": "x" * 40,
+    "WATSON_STT_API_KEY": "watson-key-from-vault",
+    "WATSON_STT_URL": "https://api.au-syd.speech-to-text.watson.cloud.ibm.com/instances/x",
+    "OPENAI_API_KEY": "openai-key-from-vault",
 }
 
 
@@ -118,6 +121,8 @@ def test_p2_production_blocked_until_phone_encryption_exists(
         ("DASHBOARD_ORIGIN", "http://dashboard.kaamsetu.example", "dashboard_origin"),
         ("PUBLIC_BASE_URL", "http://api.kaamsetu.example", "public_base_url"),
         ("PRIVACY_NOTICE_URL", "http://kaamsetu.example/privacy", "privacy_notice_url"),
+        ("WATSON_STT_API_KEY", "", "watson_stt_api_key and watson_stt_url"),
+        ("OPENAI_API_KEY", "", "openai_api_key must be set"),
     ],
 )
 def test_p1_production_rejects_unsafe_settings(
@@ -129,6 +134,17 @@ def test_p1_production_rejects_unsafe_settings(
     with pytest.raises(ValidationError, match="unsafe production settings") as exc:
         Settings()
     assert reason in _problems(exc)
+
+
+@pytest.mark.usefixtures("clean_env")
+def test_p3_production_needs_watsonx_keys_when_selected(monkeypatch: pytest.MonkeyPatch) -> None:
+    for k, v in PROD_OK.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("LLM_PROVIDER", "watsonx")
+    with pytest.raises(ValidationError) as exc:
+        Settings()
+    assert "watsonx_api_key must be set" in _problems(exc)
+    assert "watsonx_project_id must be set" in _problems(exc)
 
 
 @pytest.mark.usefixtures("clean_env")

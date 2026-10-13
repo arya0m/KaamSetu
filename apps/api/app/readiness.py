@@ -1,14 +1,18 @@
 """Pluggable readiness checks for /readyz.
 
-Phase 1 registers database, pgvector and Redis. Later phases register their
-model providers (STT, LLM, embeddings) with `ReadinessRegistry.register`.
+Database, pgvector and Redis are always checked. Model providers (STT, LLM;
+embeddings in Phase 5) are checked when configured, with results cached.
 A check is a callable that returns normally when healthy and raises otherwise.
 """
 
 import logging
+import math
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, wait
+from typing import Any
 
+import httpx
 import redis
 from sqlalchemy import text
 
@@ -82,9 +86,63 @@ def check_redis() -> None:
         client.close()
 
 
+def cached(check: Check, ttl_s: float, clock: Callable[[], float] = time.monotonic) -> Check:
+    """Remember a passing result for ttl_s so probes do not hammer paid APIs."""
+    last_ok = [-math.inf]
+
+    def run() -> None:
+        if clock() - last_ok[0] < ttl_s:
+            return
+        check()
+        last_ok[0] = clock()
+
+    return run
+
+
+def _http_ok(method: str, url: str, **kwargs: Any) -> None:
+    resp = httpx.request(method, url, timeout=get_settings().readiness_timeout_s, **kwargs)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"HTTP {resp.status_code}")
+
+
+def check_openai() -> None:
+    s = get_settings()
+    _http_ok("GET", f"{s.openai_base_url.rstrip('/')}/models",
+             headers={"Authorization": f"Bearer {s.openai_api_key}"})  # fmt: skip
+
+
+def check_watsonx() -> None:
+    """A successful IAM token exchange proves the API key works."""
+    s = get_settings()
+    _http_ok(
+        "POST",
+        s.ibm_iam_url,
+        data={"grant_type": "urn:ibm:params:oauth:grant-type:apikey", "apikey": s.watsonx_api_key},
+    )
+
+
+def check_watson_stt() -> None:
+    s = get_settings()
+    _http_ok(
+        "GET", f"{s.watson_stt_url.rstrip('/')}/v1/models", auth=("apikey", s.watson_stt_api_key)
+    )
+
+
+PROVIDER_CHECK_TTL_S = 60.0
+
+
 def default_registry() -> ReadinessRegistry:
-    registry = ReadinessRegistry(timeout_s=get_settings().readiness_timeout_s)
+    s = get_settings()
+    registry = ReadinessRegistry(timeout_s=s.readiness_timeout_s)
     registry.register("database", check_database)
     registry.register("pgvector", check_pgvector)
     registry.register("redis", check_redis)
+    # Model providers (PRD: /readyz checks model providers). Registered only when
+    # configured; production refuses to start without them (see Settings).
+    if s.watson_stt_api_key and s.watson_stt_url:
+        registry.register("stt", cached(check_watson_stt, PROVIDER_CHECK_TTL_S))
+    if s.llm_provider == "openai" and s.openai_api_key:
+        registry.register("llm", cached(check_openai, PROVIDER_CHECK_TTL_S))
+    if s.llm_provider == "watsonx" and s.watsonx_api_key:
+        registry.register("llm", cached(check_watsonx, PROVIDER_CHECK_TTL_S))
     return registry

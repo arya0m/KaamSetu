@@ -2,10 +2,14 @@
 
 import re
 import string
+from typing import TYPE_CHECKING
 
 import pytest
 
 from app import i18n
+
+if TYPE_CHECKING:
+    from app.schemas.profile import WorkerProfileData
 
 PRIVACY_URL = "https://kaamsetu.test/privacy"
 MAX_CHARS = 300  # PRD: worker messages under 300 characters
@@ -37,7 +41,7 @@ def test_fr1_placeholders_match_english(code: str) -> None:
 @pytest.mark.parametrize("code", i18n.LANGUAGE_CODES)
 @pytest.mark.parametrize("key", i18n.PER_LANGUAGE_KEYS)
 def test_fr1_messages_under_300_chars(code: str, key: str) -> None:
-    text = i18n.t(key, code, privacy_url=PRIVACY_URL, text="x" * i18n.ECHO_MAX_CHARS)
+    text = i18n.t(key, code, privacy_url=PRIVACY_URL, years="12.5")
     assert len(text) < MAX_CHARS, (code, key, len(text))
 
 
@@ -101,10 +105,66 @@ def test_fr1_parse_consent(answer: str | None, language: str, expected: bool | N
     assert i18n.parse_consent(answer, language) is expected
 
 
-def test_fr1_echo_is_clipped_to_keep_messages_short() -> None:
-    msg = i18n.echo("a" * 1000, "en")
-    assert msg.endswith("…")
+@pytest.mark.parametrize("code", i18n.LANGUAGE_CODES)
+def test_fr5_every_language_names_every_trade(code: str) -> None:
+    from app.schemas.profile import TRADES
+
+    trades = i18n._locale(code)["trades"]
+    assert set(trades) == set(TRADES)
+    assert all(trades.values())
+
+
+def _profile(**overrides: object) -> "WorkerProfileData":
+    from app.schemas.profile import WorkerProfileData
+
+    data: dict[str, object] = {
+        "primary_trade": "electrician",
+        "skills": [{"name": "house wiring", "level": "expert"}],
+        "years_experience": 8,
+        "location": {"city": "Delhi", "area": "Laxmi Nagar", "pincode": "110092"},
+        "confidence": 0.9,
+    }
+    data.update(overrides)
+    return WorkerProfileData.model_validate(data)
+
+
+@pytest.mark.parametrize("code", i18n.LANGUAGE_CODES)
+def test_fr5_summary_lists_fields_and_options_in_language(code: str) -> None:
+    msg = i18n.profile_summary(_profile(), code)
+    assert i18n.trade_name("electrician", code) in msg
+    assert "house wiring" in msg
+    assert "Laxmi Nagar, Delhi 110092" in msg
+    assert i18n.t("years_value", code, years="8") in msg
+    assert msg.endswith(i18n.t("confirm_options", code))
     assert len(msg) < MAX_CHARS
+
+
+@pytest.mark.parametrize("code", i18n.LANGUAGE_CODES)
+def test_fr5_summary_stays_short_with_many_long_skills(code: str) -> None:
+    skills = [
+        {"name": f"very long specialised skill number {i}", "level": "skilled"} for i in range(15)
+    ]
+    msg = i18n.profile_summary(_profile(skills=skills), code)
+    assert len(msg) < MAX_CHARS
+    assert "skill number 0" in msg
+
+
+def test_fr5_summary_shows_not_given_for_missing_fields() -> None:
+    msg = i18n.profile_summary(_profile(skills=[], years_experience=None, location={}), "en")
+    assert msg.count("not given") == 3
+
+
+def test_fr5_years_are_formatted_compactly() -> None:
+    assert "0.5 years" in i18n.profile_summary(_profile(years_experience=0.5), "en")
+    assert "8 years" in i18n.profile_summary(_profile(years_experience=8.0), "en")
+
+
+def test_fr2_consent_reply_matches_voice_capability() -> None:
+    assert i18n.t("describe_work_voice", "hi") in i18n.consent_granted("hi", voice_ok=True)
+    assert i18n.t("describe_work_text", "ta") in i18n.consent_granted("ta", voice_ok=False)
+    for code in i18n.LANGUAGE_CODES:
+        for voice_ok in (True, False):
+            assert len(i18n.consent_granted(code, voice_ok)) < MAX_CHARS, code
 
 
 def test_fr1_unknown_language_falls_back_to_english() -> None:

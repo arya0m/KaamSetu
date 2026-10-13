@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # KaamSetu
 
 WhatsApp job agent: a worker sends a voice note in their own language and gets a
@@ -23,3 +24,6 @@ apps/api/        FastAPI app, Celery worker, Alembic migrations, tests
 apps/dashboard/  Next.js employer/admin UI (Phase 6)
 seed/            sample jobs, courses, test voice notes (Phase 5)
 ```
+=======
+# KaamSetu
+>>>>>>> 8e88597a3ec8cb45cfe4e43838e531aa7011a6f5
